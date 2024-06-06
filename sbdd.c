@@ -34,11 +34,14 @@ struct sbdd {
 	u8                      *data;
 	struct gendisk          *gd;
 	struct request_queue    *q;
+	struct block_device     *bdev;
+	struct block_device     *target_bdev;
 };
 
 static struct sbdd      __sbdd;
 static int              __sbdd_major = 0;
 static unsigned long    __sbdd_capacity_mib = 100;
+static char*            target_device_path = NULL;
 
 static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 {
@@ -91,8 +94,19 @@ static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 		return BLK_STS_IOERR;
 	}
 
-	sbdd_xfer_bio(bio);
-	bio_endio(bio);
+	if (__sbdd.target_bdev) {
+		struct bio *cloned_bio = bio_clone_fast(bio, GFP_KERNEL, NULL);
+		if (!cloned_bio) {
+			bio_io_error(bio);
+			return BLK_STS_IOERR;
+		}
+
+		bio_set_dev(cloned_bio, __sbdd.target_bdev);
+		submit_bio(cloned_bio);
+	} else {
+		sbdd_xfer_bio(bio);
+		bio_endio(bio);
+	}
 
 	if (atomic_dec_and_test(&__sbdd.refs_cnt))
 		wake_up(&__sbdd.exitwait);
@@ -126,11 +140,23 @@ static int sbdd_create(void)
 	memset(&__sbdd, 0, sizeof(struct sbdd));
 	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
 
-	pr_info("allocating data\n");
-	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
-	if (!__sbdd.data) {
-		pr_err("unable to alloc data\n");
-		return -ENOMEM;
+	if (target_device_path) {
+		__sbdd.target_bdev = blkdev_get_by_path(target_device_path,
+							FMODE_READ | FMODE_WRITE,
+							NULL);
+		if (IS_ERR(__sbdd.target_bdev)) {
+			pr_err("Failed to get target block device: %ld\n",
+				PTR_ERR(__sbdd.target_bdev));
+			return PTR_ERR(__sbdd.target_bdev);
+		}
+		__sbdd.capacity = get_capacity(__sbdd.target_bdev->bd_disk);
+	} else {
+		pr_info("allocating data\n");
+		__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
+		if (!__sbdd.data) {
+			pr_err("unable to alloc data\n");
+			return -ENOMEM;
+		}
 	}
 
 	spin_lock_init(&__sbdd.datalock);
@@ -142,6 +168,7 @@ static int sbdd_create(void)
 		pr_err("call blk_alloc_queue() failed\n");
 		return -EINVAL;
 	}
+
 	blk_queue_make_request(__sbdd.q, sbdd_make_request);
 
 	/* Configure queue */
@@ -197,6 +224,9 @@ static void sbdd_delete(void)
 		vfree(__sbdd.data);
 	}
 
+	if (__sbdd.target_bdev)
+		blkdev_put(__sbdd.target_bdev, FMODE_READ | FMODE_WRITE);
+
 	memset(&__sbdd, 0, sizeof(struct sbdd));
 
 	if (__sbdd_major > 0) {
@@ -248,6 +278,10 @@ module_exit(sbdd_exit);
 
 /* Set desired capacity with insmod */
 module_param_named(capacity_mib, __sbdd_capacity_mib, ulong, S_IRUGO);
+
+/* Specify target block device path */
+module_param(target_device_path, charp, 0000);
+MODULE_PARM_DESC(target_device_path, "Target device path");
 
 /* Note for the kernel: a free license module. A warning will be outputted without it. */
 MODULE_LICENSE("GPL");
